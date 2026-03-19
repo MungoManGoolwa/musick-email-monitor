@@ -3,7 +3,7 @@
 musick.com.au Email Monitor
 ============================
 Monitors a Gmail inbox (via IMAP) for forwarded emails, analyzes them
-with Gemini, and sends back actionable instructions.
+with Claude (Anthropic API), and sends back actionable instructions.
 
 Usage:
     python3 email_monitor.py check       # Check for new emails and process them
@@ -27,7 +27,6 @@ import smtplib
 import sqlite3
 import sys
 import urllib.request
-import urllib.parse
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -49,8 +48,10 @@ IMAP_PORT = 993
 # Response recipient
 RESPONSE_TO = "brendan@faulds.au"
 
-# Gemini API endpoint
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+# Anthropic Messages API (default model: strongest general model for careful triage)
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_CLAUDE_MODEL = "claude-opus-4-6"
 
 logger = logging.getLogger("email_monitor")
 
@@ -66,6 +67,19 @@ def load_secrets() -> dict:
         sys.exit(1)
     with open(SECRETS_PATH) as f:
         return json.load(f)
+
+
+def anthropic_api_key(secrets: dict) -> str | None:
+    k = secrets.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    if not k:
+        return None
+    k = str(k).strip()
+    return k or None
+
+
+def claude_model_id(secrets: dict) -> str:
+    m = secrets.get("claude_model") or DEFAULT_CLAUDE_MODEL
+    return str(m).strip() or DEFAULT_CLAUDE_MODEL
 
 
 def monitor_inbox_addresses(secrets: dict) -> list[str]:
@@ -245,7 +259,7 @@ def imap_mark_seen(secrets: dict, imap_num) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gemini API — analyze the email content
+# Anthropic (Claude) — analyze the email content
 # ---------------------------------------------------------------------------
 
 ANALYSIS_PROMPT = """You are an expert SEO and web operations advisor for musick.com.au, an Australian live music discovery platform.
@@ -288,8 +302,19 @@ Here is the forwarded email:
 """
 
 
-def analyze_with_gemini(email_data: dict, api_key: str) -> str | None:
-    """Send email content to Gemini for analysis."""
+def _anthropic_assistant_text(result: dict) -> str | None:
+    blocks = result.get("content") or []
+    parts: list[str] = []
+    for b in blocks:
+        if isinstance(b, dict) and b.get("type") == "text":
+            t = b.get("text")
+            if t:
+                parts.append(t)
+    return "\n".join(parts) if parts else None
+
+
+def analyze_with_claude(email_data: dict, api_key: str, model: str) -> str | None:
+    """Send email content to Claude via the Anthropic Messages API."""
     prompt = ANALYSIS_PROMPT.format(
         sender=email_data["sender"],
         subject=email_data["subject"],
@@ -297,40 +322,41 @@ def analyze_with_gemini(email_data: dict, api_key: str) -> str | None:
         body=email_data["body"],
     )
 
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
+    payload = json.dumps(
+        {
+            "model": model,
+            "max_tokens": 4096,
             "temperature": 0.3,
-            "maxOutputTokens": 4096,
+            "messages": [{"role": "user", "content": prompt}],
         }
-    }).encode("utf-8")
-
-    url = f"{GEMINI_API_URL}?key={api_key}"
+    ).encode("utf-8")
 
     req = urllib.request.Request(
-        url,
+        ANTHROPIC_MESSAGES_URL,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+        },
         method="POST",
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with urllib.request.urlopen(req, timeout=180) as response:
             result = json.loads(response.read().decode("utf-8"))
-            candidates = result.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "")
-            logger.warning("Gemini returned no candidates")
+            text = _anthropic_assistant_text(result)
+            if text:
+                return text
+            logger.warning("Claude returned no text blocks")
             return None
 
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        logger.error(f"Gemini API error {e.code}: {body[:500]}")
+        logger.error(f"Anthropic API error {e.code}: {body[:800]}")
         return None
     except Exception as e:
-        logger.error(f"Gemini API call failed: {e}")
+        logger.error(f"Anthropic API call failed: {e}")
         return None
 
 
@@ -415,11 +441,12 @@ def cmd_check(args, secrets):
         logger.info("No new monitor emails found.")
         return
 
-    api_key = secrets.get("gemini_api_key")
+    api_key = anthropic_api_key(secrets)
     if not api_key:
-        logger.error("No gemini_api_key in .secrets.json")
+        logger.error("No anthropic_api_key in .secrets.json (or ANTHROPIC_API_KEY in the environment)")
         return
 
+    model = claude_model_id(secrets)
     processed = 0
     for em in emails:
         mid = em["message_id"]
@@ -429,8 +456,8 @@ def cmd_check(args, secrets):
             imap_mark_seen(secrets, em["imap_num"])
             continue
 
-        logger.info(f"Analyzing: {em['subject']}")
-        analysis = analyze_with_gemini(em, api_key)
+        logger.info(f"Analyzing with {model}: {em['subject']}")
+        analysis = analyze_with_claude(em, api_key, model)
 
         if not analysis:
             logger.error(f"Analysis failed for: {em['subject']}")
@@ -458,6 +485,7 @@ def cmd_status(args, secrets):
     for addr in monitor_inbox_addresses(secrets):
         print(f"  Monitor address: {addr}")
     print(f"  Responses to:    {RESPONSE_TO}")
+    print(f"  Claude model:    {claude_model_id(secrets)}")
     print(f"  Database:        {DB_PATH}")
 
     cur = conn.execute("SELECT COUNT(*) FROM processed_emails")

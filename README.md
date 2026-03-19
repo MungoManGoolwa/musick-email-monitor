@@ -1,12 +1,12 @@
 # musick-email-monitor
 
-Small service for **musick.com.au**: poll a dedicated Gmail inbox for forwarded errors/alerts, analyze with **Gemini**, and email back a structured brief including **Claude Code**-style remediation commands.
+Small service for **musick.com.au**: poll a dedicated Gmail inbox for forwarded errors/alerts, analyze with **Claude** (Anthropic API), and email back a structured brief including **Claude Code**-style remediation commands.
 
 ## Requirements
 
 - **Python 3.10+** (stdlib only — no `pip install`)
 - Gmail **App Password** if 2FA is on ([Google help](https://support.google.com/accounts/answer/185833))
-- A [Google AI Studio](https://aistudio.google.com/) API key for Gemini
+- An [Anthropic API key](https://console.anthropic.com/) (`sk-ant-api03-…`). Optional: set `ANTHROPIC_API_KEY` in the environment instead of putting the key in `.secrets.json`.
 
 ## Setup
 
@@ -14,7 +14,8 @@ Small service for **musick.com.au**: poll a dedicated Gmail inbox for forwarded 
 cd musick-email-monitor
 cp .secrets.example.json .secrets.json
 chmod 600 .secrets.json
-# Edit .secrets.json: smtp_*, gemini_api_key
+# Edit .secrets.json: smtp_*, anthropic_api_key
+# Optional: "claude_model" (default claude-opus-4-6 — override e.g. for Sonnet if you prefer cost/latency)
 ```
 
 ## Usage
