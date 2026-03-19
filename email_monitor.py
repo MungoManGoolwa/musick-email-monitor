@@ -3,7 +3,7 @@
 musick.com.au Email Monitor
 ============================
 Monitors a Gmail inbox (via IMAP) for forwarded emails, analyzes them
-with Claude (Anthropic API), and sends back actionable instructions.
+with Claude (Anthropic Console API or Claude Code CLI for subscription OAuth), and sends back actionable instructions.
 
 Usage:
     python3 email_monitor.py check       # Check for new emails and process them
@@ -23,6 +23,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import time
 import smtplib
 import sqlite3
@@ -437,6 +439,39 @@ Here is the forwarded email:
 """
 
 
+def claude_cli_model_alias(model_id: str) -> str:
+    """Map API-style model id to `claude -p --model` alias (subscription CLI)."""
+    m = (model_id or "").strip().lower()
+    if "haiku" in m:
+        return "haiku"
+    if "sonnet" in m:
+        return "sonnet"
+    if "opus" in m:
+        return "opus"
+    return "opus"
+
+
+def resolve_claude_cli_bin(secrets: dict) -> str | None:
+    for candidate in (
+        secrets.get("claude_cli_path"),
+        os.environ.get("CLAUDE_CODE_CLI"),
+        os.environ.get("CLAUDE_BIN"),
+    ):
+        if candidate:
+            p = Path(str(candidate).strip()).expanduser()
+            if p.is_file():
+                return str(p)
+    w = shutil.which("claude")
+    if w:
+        return w
+    home = Path.home()
+    for rel in (".nvm/current/bin/claude", ".local/bin/claude"):
+        p = home / rel
+        if p.is_file():
+            return str(p)
+    return None
+
+
 def _anthropic_assistant_text(result: dict) -> str | None:
     blocks = result.get("content") or []
     parts: list[str] = []
@@ -448,8 +483,8 @@ def _anthropic_assistant_text(result: dict) -> str | None:
     return "\n".join(parts) if parts else None
 
 
-def analyze_with_claude(email_data: dict, credential: str, model: str, auth_mode: str) -> str | None:
-    """Send email content to Claude via the Anthropic Messages API."""
+def analyze_with_claude_http(email_data: dict, credential: str, model: str, auth_mode: str) -> str | None:
+    """Send email content to Claude via the Anthropic Messages API (Console API key)."""
     prompt = ANALYSIS_PROMPT.format(
         sender=email_data["sender"],
         subject=email_data["subject"],
@@ -499,6 +534,65 @@ def analyze_with_claude(email_data: dict, credential: str, model: str, auth_mode
     except Exception as e:
         logger.error(f"Anthropic API call failed: {e}")
         return None
+
+
+def analyze_with_claude_code_cli(email_data: dict, model: str, secrets: dict) -> str | None:
+    """
+    Run analysis via `claude -p` (Claude Code CLI). Uses the same Claude subscription / OAuth
+    session as `claude auth login --claudeai` — direct Messages API OAuth from Python is unreliable.
+    """
+    cli = resolve_claude_cli_bin(secrets)
+    if not cli:
+        logger.error("Claude Code CLI not found; install Claude Code or set claude_cli_path in .secrets.json")
+        return None
+
+    prompt = ANALYSIS_PROMPT.format(
+        sender=email_data["sender"],
+        subject=email_data["subject"],
+        date=email_data["date"],
+        body=email_data["body"],
+    )
+    alias = claude_cli_model_alias(model)
+    timeout_sec = int(secrets.get("claude_cli_timeout_sec") or 600)
+
+    try:
+        result = subprocess.run(
+            [
+                cli,
+                "-p",
+                prompt,
+                "--model",
+                alias,
+                "--permission-mode",
+                "dontAsk",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            cwd=str(SCRIPT_DIR),
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("Claude Code CLI timed out after %ss", timeout_sec)
+        return None
+    except OSError as e:
+        logger.error("Could not run Claude Code CLI: %s", e)
+        return None
+
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        logger.error("Claude Code CLI exited %s: %s", result.returncode, err[:800])
+        return None
+
+    out = (result.stdout or "").strip()
+    return out or None
+
+
+def analyze_forwarded_email(
+    email_data: dict, credential: str, model: str, auth_mode: str, secrets: dict
+) -> str | None:
+    if auth_mode == "oauth":
+        return analyze_with_claude_code_cli(email_data, model, secrets)
+    return analyze_with_claude_http(email_data, credential, model, auth_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +686,12 @@ def cmd_check(args, secrets):
         return
 
     model = claude_model_id(secrets)
-    logger.info("Using Anthropic auth from %s (%s)", auth_src, auth_mode)
+    logger.info(
+        "Using Anthropic auth from %s (%s)%s",
+        auth_src,
+        auth_mode,
+        " → Claude Code CLI" if auth_mode == "oauth" else "",
+    )
     processed = 0
     for em in emails:
         mid = em["message_id"]
@@ -603,7 +702,7 @@ def cmd_check(args, secrets):
             continue
 
         logger.info(f"Analyzing with {model}: {em['subject']}")
-        analysis = analyze_with_claude(em, credential, model, auth_mode)
+        analysis = analyze_forwarded_email(em, credential, model, auth_mode, secrets)
 
         if not analysis:
             logger.error(f"Analysis failed for: {em['subject']}")
@@ -634,7 +733,8 @@ def cmd_status(args, secrets):
     print(f"  Claude model:    {claude_model_id(secrets)}")
     cred, mode, src = resolve_anthropic_auth(secrets)
     if cred and mode:
-        print(f"  Anthropic auth:  {mode} ← {src}")
+        via = " (analysis via Claude Code CLI)" if mode == "oauth" else ""
+        print(f"  Anthropic auth:  {mode} ← {src}{via}")
     else:
         print("  Anthropic auth:  (not configured)")
     print(f"  Database:        {DB_PATH}")

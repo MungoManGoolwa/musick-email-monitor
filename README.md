@@ -8,7 +8,7 @@ Small service for **musick.com.au**: poll a dedicated Gmail inbox for forwarded 
 - Gmail **App Password** if 2FA is on ([Google help](https://support.google.com/accounts/answer/185833))
 - Anthropic access, one of:
   - **Console API key** (`sk-ant-api03-…`) from [console.anthropic.com](https://console.anthropic.com/) — set `anthropic_api_key` or `ANTHROPIC_API_KEY`, or `anthropic_api_key_file` pointing at a file that contains only the key.
-  - **Same login as OpenClaw / Claude Code**: a valid OAuth access token in `~/.claude/.credentials.json` (refreshed by `claude login` or the Claude Code app). OpenClaw’s `~/.openclaw/agents/main/agent/auth-profiles.json` often holds a separate `sk-ant-oat…` record; that file alone is **not** enough for this script’s direct HTTP calls — use a fresh Claude Code session or a Console API key.
+  - **Same login as OpenClaw / Claude Code** (`claude auth login --claudeai`): the monitor checks `~/.claude/.credentials.json` for a **non-expired** OAuth access token. Analysis then runs through the **`claude -p`** CLI (same subscription as Claude Code), because direct `curl`/Python calls to the Messages API with OAuth tokens are brittle. Ensure `claude` is on `PATH` for cron, or set `claude_cli_path` in `.secrets.json`.
 
 ## Setup
 
