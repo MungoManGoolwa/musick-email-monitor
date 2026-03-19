@@ -6,7 +6,9 @@ Small service for **musick.com.au**: poll a dedicated Gmail inbox for forwarded 
 
 - **Python 3.10+** (stdlib only — no `pip install`)
 - Gmail **App Password** if 2FA is on ([Google help](https://support.google.com/accounts/answer/185833))
-- An [Anthropic API key](https://console.anthropic.com/) (`sk-ant-api03-…`). Optional: set `ANTHROPIC_API_KEY` in the environment instead of putting the key in `.secrets.json`.
+- Anthropic access, one of:
+  - **Console API key** (`sk-ant-api03-…`) from [console.anthropic.com](https://console.anthropic.com/) — set `anthropic_api_key` or `ANTHROPIC_API_KEY`, or `anthropic_api_key_file` pointing at a file that contains only the key.
+  - **Same login as OpenClaw / Claude Code**: a valid OAuth access token in `~/.claude/.credentials.json` (refreshed by `claude login` or the Claude Code app). OpenClaw’s `~/.openclaw/agents/main/agent/auth-profiles.json` often holds a separate `sk-ant-oat…` record; that file alone is **not** enough for this script’s direct HTTP calls — use a fresh Claude Code session or a Console API key.
 
 ## Setup
 
@@ -14,8 +16,9 @@ Small service for **musick.com.au**: poll a dedicated Gmail inbox for forwarded 
 cd musick-email-monitor
 cp .secrets.example.json .secrets.json
 chmod 600 .secrets.json
-# Edit .secrets.json: smtp_*, anthropic_api_key
-# Optional: "claude_model" (default claude-opus-4-6 — override e.g. for Sonnet if you prefer cost/latency)
+# Edit .secrets.json: smtp_*, and either anthropic_api_key OR anthropic_api_key_file OR rely on Claude Code OAuth
+# Optional: "claude_model" (default claude-opus-4-6)
+# Optional: openclaw_auth_profiles_path, openclaw_anthropic_profile_id (only if that profile stores sk-ant-api03… inline)
 ```
 
 ## Usage

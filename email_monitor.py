@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import time
 import smtplib
 import sqlite3
 import sys
@@ -51,6 +52,10 @@ RESPONSE_TO = "brendan@faulds.au"
 # Anthropic Messages API (default model: strongest general model for careful triage)
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+# Same OAuth beta stack OpenClaw uses for Claude subscription / Claude Code tokens (sk-ant-oat…)
+ANTHROPIC_OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20"
+DEFAULT_OPENCLAW_AUTH_PROFILES = Path.home() / ".openclaw/agents/main/agent/auth-profiles.json"
+DEFAULT_CLAUDE_CREDENTIALS = Path.home() / ".claude/.credentials.json"
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-6"
 
 logger = logging.getLogger("email_monitor")
@@ -69,12 +74,142 @@ def load_secrets() -> dict:
         return json.load(f)
 
 
-def anthropic_api_key(secrets: dict) -> str | None:
-    k = secrets.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
-    if not k:
+def _classify_anthropic_credential(value: str) -> str | None:
+    """Return auth style for Anthropic Messages API, or None if unusable."""
+    if not value or not str(value).strip():
         return None
-    k = str(k).strip()
-    return k or None
+    s = str(value).strip()
+    if s.startswith("sk-ant-api"):
+        return "api_key"
+    if "sk-ant-oat" in s:
+        return "oauth"
+    return None
+
+
+def _profile_raw_secret(profile: dict) -> str | None:
+    """Inline secret only (OpenClaw keyRef resolution is not duplicated here)."""
+    ptype = profile.get("type")
+    if ptype == "api_key":
+        k = profile.get("key")
+        return str(k).strip() if k else None
+    if ptype == "token":
+        t = profile.get("token")
+        return str(t).strip() if t else None
+    return None
+
+
+def _load_openclaw_anthropic_secret(secrets: dict) -> tuple[str | None, str]:
+    """Read Anthropic credential from OpenClaw's auth-profiles.json (inline secrets only — not keyRef)."""
+    raw_path = (
+        secrets.get("openclaw_auth_profiles_path")
+        or os.environ.get("OPENCLAW_AUTH_PROFILES")
+        or str(DEFAULT_OPENCLAW_AUTH_PROFILES)
+    )
+    path = Path(raw_path).expanduser()
+    if not path.is_file():
+        return None, ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Could not read OpenClaw auth profiles %s: %s", path, e)
+        return None, ""
+    profile_id = secrets.get("openclaw_anthropic_profile_id")
+    if not profile_id:
+        profile_id = (data.get("lastGood") or {}).get("anthropic")
+    if not profile_id:
+        return None, str(path)
+    profile = (data.get("profiles") or {}).get(profile_id)
+    if not profile:
+        return None, str(path)
+    secret = _profile_raw_secret(profile)
+    if not secret:
+        return None, str(path)
+    return secret, str(path)
+
+
+def _load_claude_code_oauth_access_token() -> str | None:
+    """Claude Code stores subscription OAuth beside OpenClaw; token is often fresher after `claude login`."""
+    if not DEFAULT_CLAUDE_CREDENTIALS.is_file():
+        return None
+    try:
+        data = json.loads(DEFAULT_CLAUDE_CREDENTIALS.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    oauth = data.get("claudeAiOauth") or {}
+    token = oauth.get("accessToken")
+    if not token:
+        return None
+    exp_ms = oauth.get("expiresAt")
+    if exp_ms is not None:
+        try:
+            if int(exp_ms) < int(time.time() * 1000):
+                logger.warning(
+                    "Claude Code OAuth token in ~/.claude/.credentials.json is expired; run `claude login` "
+                    "or set anthropic_api_key / ANTHROPIC_API_KEY."
+                )
+                return None
+        except (TypeError, ValueError):
+            pass
+    return str(token).strip() or None
+
+
+def resolve_anthropic_auth(secrets: dict) -> tuple[str | None, str | None, str]:
+    """
+    Resolve credential for Anthropic Messages API.
+    Returns (credential, auth_mode, source_label).
+    auth_mode is 'api_key' (x-api-key) or 'oauth' (Bearer + beta headers).
+
+    OpenClaw typically stores Claude *subscription* OAuth (sk-ant-oat…) in auth-profiles.json.
+    That value is not a Console API key; for REST calls the refreshed access token in
+    ~/.claude/.credentials.json (Claude Code / same login) is used when still valid.
+    """
+    merged = dict(secrets)
+    key_file = merged.get("anthropic_api_key_file")
+    key_file_resolved: str | None = None
+    if key_file:
+        p = Path(str(key_file).strip()).expanduser()
+        if p.is_file():
+            try:
+                from_file = p.read_text(encoding="utf-8").strip()
+                if from_file:
+                    merged["anthropic_api_key"] = from_file
+                    key_file_resolved = str(p)
+            except OSError as e:
+                logger.warning("Could not read anthropic_api_key_file %s: %s", p, e)
+
+    explicit = merged.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    if explicit:
+        s = str(explicit).strip()
+        mode = _classify_anthropic_credential(s)
+        if mode:
+            src = (
+                f"anthropic_api_key_file ({key_file_resolved})"
+                if key_file_resolved
+                else "anthropic_api_key or ANTHROPIC_API_KEY"
+            )
+            return s, mode, src
+        logger.error(
+            "anthropic_api_key / ANTHROPIC_API_KEY is not a valid Anthropic secret "
+            "(expected sk-ant-api03… for Console API, or sk-ant-oat… for OAuth)."
+        )
+        return None, None, ""
+
+    # Same OAuth pool as Claude Code — token is refreshed by the Claude CLI / IDE integration.
+    cc = _load_claude_code_oauth_access_token()
+    if cc and _classify_anthropic_credential(cc) == "oauth":
+        return cc, "oauth", f"Claude Code OAuth ({DEFAULT_CLAUDE_CREDENTIALS})"
+
+    oc_secret, oc_path = _load_openclaw_anthropic_secret(merged)
+    if oc_secret:
+        mode = _classify_anthropic_credential(oc_secret)
+        if mode == "api_key":
+            return oc_secret, "api_key", f"OpenClaw auth-profiles ({oc_path})"
+        if mode == "oauth":
+            logger.debug(
+                "Skipping OpenClaw auth-profiles OAuth (sk-ant-oat…); prefer Claude Code credentials or Console API key."
+            )
+
+    return None, None, ""
 
 
 def claude_model_id(secrets: dict) -> str:
@@ -192,7 +327,7 @@ def extract_text_from_email(msg) -> str:
 
 
 def fetch_monitor_emails(secrets: dict) -> list[dict]:
-    """Connect to Gmail IMAP and fetch unread emails to the +monitor alias."""
+    """Connect to Gmail IMAP and fetch unread mail to the monitor inbox addresses."""
     emails = []
 
     try:
@@ -313,7 +448,7 @@ def _anthropic_assistant_text(result: dict) -> str | None:
     return "\n".join(parts) if parts else None
 
 
-def analyze_with_claude(email_data: dict, api_key: str, model: str) -> str | None:
+def analyze_with_claude(email_data: dict, credential: str, model: str, auth_mode: str) -> str | None:
     """Send email content to Claude via the Anthropic Messages API."""
     prompt = ANALYSIS_PROMPT.format(
         sender=email_data["sender"],
@@ -331,14 +466,20 @@ def analyze_with_claude(email_data: dict, api_key: str, model: str) -> str | Non
         }
     ).encode("utf-8")
 
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "anthropic-version": ANTHROPIC_VERSION,
+    }
+    if auth_mode == "oauth":
+        headers["Authorization"] = f"Bearer {credential}"
+        headers["anthropic-beta"] = ANTHROPIC_OAUTH_BETA
+    else:
+        headers["x-api-key"] = credential
+
     req = urllib.request.Request(
         ANTHROPIC_MESSAGES_URL,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": ANTHROPIC_VERSION,
-        },
+        headers=headers,
         method="POST",
     )
 
@@ -441,12 +582,17 @@ def cmd_check(args, secrets):
         logger.info("No new monitor emails found.")
         return
 
-    api_key = anthropic_api_key(secrets)
-    if not api_key:
-        logger.error("No anthropic_api_key in .secrets.json (or ANTHROPIC_API_KEY in the environment)")
+    credential, auth_mode, auth_src = resolve_anthropic_auth(secrets)
+    if not credential or not auth_mode:
+        logger.error(
+            "No Anthropic credential found. Options: set anthropic_api_key or ANTHROPIC_API_KEY; "
+            "or use OpenClaw's ~/.openclaw/agents/main/agent/auth-profiles.json; "
+            "or refresh Claude Code OAuth (~/.claude/.credentials.json via `claude login`)."
+        )
         return
 
     model = claude_model_id(secrets)
+    logger.info("Using Anthropic auth from %s (%s)", auth_src, auth_mode)
     processed = 0
     for em in emails:
         mid = em["message_id"]
@@ -457,7 +603,7 @@ def cmd_check(args, secrets):
             continue
 
         logger.info(f"Analyzing with {model}: {em['subject']}")
-        analysis = analyze_with_claude(em, api_key, model)
+        analysis = analyze_with_claude(em, credential, model, auth_mode)
 
         if not analysis:
             logger.error(f"Analysis failed for: {em['subject']}")
@@ -486,6 +632,11 @@ def cmd_status(args, secrets):
         print(f"  Monitor address: {addr}")
     print(f"  Responses to:    {RESPONSE_TO}")
     print(f"  Claude model:    {claude_model_id(secrets)}")
+    cred, mode, src = resolve_anthropic_auth(secrets)
+    if cred and mode:
+        print(f"  Anthropic auth:  {mode} ← {src}")
+    else:
+        print("  Anthropic auth:  (not configured)")
     print(f"  Database:        {DB_PATH}")
 
     cur = conn.execute("SELECT COUNT(*) FROM processed_emails")
