@@ -25,11 +25,13 @@ chmod 600 .secrets.json
 
 ```bash
 python3 email_monitor.py status   # show monitor addresses + DB stats
-python3 email_monitor.py check    # fetch unread → analyze → reply to brendan@faulds.au
+python3 email_monitor.py check    # fetch unread → analyze → reply (see response_to below)
 python3 email_monitor.py test     # send a self-test to the +monitor address
 ```
 
-Forward mail **To** `au.musick.com@gmail.com` or `au.musick.com+monitor@gmail.com`. Unread messages matching either address are processed once (tracked in `email_monitor.sqlite`).
+Set **`response_to`** in `.secrets.json` (or env `RESPONSE_TO`) to where analysis emails should go — default is `brendan@faulds.com`.
+
+Forward or address mail **To** `au.musick.com@gmail.com` or `au.musick.com+monitor@gmail.com`. Messages must stay **unread** in Gmail until `check` runs (or they are skipped). If a provider’s `To:` line is odd, the script falls back to scanning recent **UNSEEN** mail and matching `Delivered-To` / `X-Original-To` / etc. Keep reports in **INBOX** unless you set **`imap_mailbox`** (e.g. a Gmail label exposed to IMAP).
 
 ## Automation (OpenClaw)
 

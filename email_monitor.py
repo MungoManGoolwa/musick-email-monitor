@@ -11,7 +11,7 @@ Usage:
     python3 email_monitor.py test        # Send a test email to yourself
 
 Forward error/alert emails to au.musick.com@gmail.com (or au.musick.com+monitor@gmail.com).
-Responses are sent to brendan@faulds.au.
+Replies go to response_to in .secrets.json (default brendan@faulds.com).
 """
 
 import argparse
@@ -48,8 +48,8 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 
-# Response recipient
-RESPONSE_TO = "brendan@faulds.au"
+# Where analysis replies are sent (override with response_to in .secrets.json or RESPONSE_TO env)
+DEFAULT_RESPONSE_TO = "brendan@faulds.com"
 
 # Anthropic Messages API (default model: strongest general model for careful triage)
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
@@ -214,6 +214,13 @@ def resolve_anthropic_auth(secrets: dict) -> tuple[str | None, str | None, str]:
     return None, None, ""
 
 
+def response_to_address(secrets: dict) -> str:
+    r = secrets.get("response_to") or os.environ.get("RESPONSE_TO")
+    if r and str(r).strip():
+        return str(r).strip()
+    return DEFAULT_RESPONSE_TO
+
+
 def claude_model_id(secrets: dict) -> str:
     m = secrets.get("claude_model") or DEFAULT_CLAUDE_MODEL
     return str(m).strip() or DEFAULT_CLAUDE_MODEL
@@ -328,6 +335,32 @@ def extract_text_from_email(msg) -> str:
     return "\n".join(body_parts)[:8000]  # Cap at 8K chars for API
 
 
+def message_is_for_monitor(msg: email.message.Message, monitor_addrs: list[str]) -> bool:
+    """
+    True if any monitor address appears in recipient-related headers.
+    Gmail IMAP SEARCH TO "..." misses some forwards / Bcc / mailing-list shapes; this is the fallback.
+    """
+    want = [a.lower().strip() for a in monitor_addrs if a and str(a).strip()]
+    if not want:
+        return False
+    headers = (
+        "To",
+        "Cc",
+        "Delivered-To",
+        "X-Delivered-To",
+        "X-Original-To",
+        "Envelope-To",
+        "X-Forwarded-To",
+        "X-Forwarded-For",
+    )
+    blob = ""
+    for h in headers:
+        for v in msg.get_all(h, []) or []:
+            blob += " " + str(v)
+    blob_l = blob.lower()
+    return any(a in blob_l for a in want)
+
+
 def fetch_monitor_emails(secrets: dict) -> list[dict]:
     """Connect to Gmail IMAP and fetch unread mail to the monitor inbox addresses."""
     emails = []
@@ -335,19 +368,51 @@ def fetch_monitor_emails(secrets: dict) -> list[dict]:
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(secrets["smtp_user"], secrets["smtp_pass"])
-        mail.select("INBOX")
+        mailbox = (secrets.get("imap_mailbox") or "INBOX").strip() or "INBOX"
+        mail.select(mailbox)
 
-        # Unread mail To the monitor inbox (base address or +monitor alias — both are valid)
         addrs = monitor_inbox_addresses(secrets)
-        or_clauses = " ".join(f'TO "{a}"' for a in addrs)
-        search_query = f"(UNSEEN (OR {or_clauses}))"
-        status, data = mail.search(None, search_query)
 
+        # Prefer tight TO search; fall back to all UNSEEN + header filter (catches awkward forwards)
+        or_clauses = " ".join(f'TO "{a}"' for a in addrs)
+        tight_query = f"(UNSEEN (OR {or_clauses}))"
+        status, data = mail.search(None, tight_query)
         if status != "OK":
             logger.warning(f"IMAP search failed: {status}")
             return emails
 
         message_ids = data[0].split()
+        if not message_ids:
+            status, data = mail.search(None, "UNSEEN")
+            if status == "OK" and data and data[0]:
+                candidate_ids = data[0].split()
+                unseen_total = len(candidate_ids)
+                try:
+                    scan_max = int(secrets.get("imap_unseen_header_scan_max") or 200)
+                except (TypeError, ValueError):
+                    scan_max = 200
+                scan_max = max(1, min(scan_max, 2000))
+                if len(candidate_ids) > scan_max:
+                    candidate_ids = candidate_ids[-scan_max:]
+                    logger.debug(
+                        "Scanning newest %s of %s UNSEEN for monitor headers",
+                        scan_max,
+                        unseen_total,
+                    )
+                message_ids = []
+                for num in candidate_ids:
+                    st, msg_data = mail.fetch(num, "(RFC822)")
+                    if st != "OK":
+                        continue
+                    msg = email.message_from_bytes(msg_data[0][1])
+                    if message_is_for_monitor(msg, addrs):
+                        message_ids.append(num)
+                if message_ids:
+                    logger.info(
+                        "Matched %s unread message(s) via recipient headers (TO search had 0 hits)",
+                        len(message_ids),
+                    )
+
         logger.info(f"Found {len(message_ids)} unread monitor emails")
 
         for num in message_ids:
@@ -357,6 +422,9 @@ def fetch_monitor_emails(secrets: dict) -> list[dict]:
 
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
+
+            if not message_is_for_monitor(msg, addrs):
+                continue
 
             message_id = msg.get("Message-ID", f"unknown-{num.decode()}")
             subject = decode_subject(msg)
@@ -388,7 +456,8 @@ def imap_mark_seen(secrets: dict, imap_num) -> None:
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(secrets["smtp_user"], secrets["smtp_pass"])
-        mail.select("INBOX")
+        mailbox = (secrets.get("imap_mailbox") or "INBOX").strip() or "INBOX"
+        mail.select(mailbox)
         mail.store(imap_num, "+FLAGS", "\\Seen")
         mail.logout()
     except Exception as e:
@@ -643,7 +712,8 @@ def send_response(email_data: dict, analysis: str, secrets: dict) -> bool:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = secrets["smtp_user"]
-        msg["To"] = RESPONSE_TO
+        to_addr = response_to_address(secrets)
+        msg["To"] = to_addr
 
         msg.attach(MIMEText(analysis, "plain", "utf-8"))
         msg.attach(MIMEText(full_html, "html", "utf-8"))
@@ -653,9 +723,9 @@ def send_response(email_data: dict, analysis: str, secrets: dict) -> bool:
             server.starttls()
             server.ehlo()
             server.login(secrets["smtp_user"], secrets["smtp_pass"])
-            server.sendmail(secrets["smtp_user"], [RESPONSE_TO], msg.as_string())
+            server.sendmail(secrets["smtp_user"], [to_addr], msg.as_string())
 
-        logger.info(f"Response sent to {RESPONSE_TO}")
+        logger.info("Response sent to %s", to_addr)
         return True
 
     except Exception as e:
@@ -727,7 +797,7 @@ def cmd_status(args, secrets):
 
     for addr in monitor_inbox_addresses(secrets):
         print(f"  Monitor address: {addr}")
-    print(f"  Responses to:    {RESPONSE_TO}")
+    print(f"  Responses to:    {response_to_address(secrets)}")
     print(f"  Claude model:    {claude_model_id(secrets)}")
     cred, mode, src = resolve_anthropic_auth(secrets)
     if cred and mode:
