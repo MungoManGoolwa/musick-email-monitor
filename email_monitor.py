@@ -705,9 +705,7 @@ def cmd_check(args, secrets):
         analysis = analyze_forwarded_email(em, credential, model, auth_mode, secrets)
 
         if not analysis:
-            logger.error(f"Analysis failed for: {em['subject']}")
-            mark_processed(conn, mid, em["subject"], em["sender"], em["date"], "Analysis failed", False)
-            imap_mark_seen(secrets, em["imap_num"])
+            logger.error(f"Analysis failed for: {em['subject']} — will retry on next run")
             continue
 
         sent = send_response(em, analysis, secrets)
@@ -760,6 +758,54 @@ def cmd_status(args, secrets):
     conn.close()
 
 
+def cmd_retry(args, secrets):
+    """Re-analyze and resend for emails where the response was never sent."""
+    conn = init_db()
+
+    credential, auth_mode, auth_src = resolve_anthropic_auth(secrets)
+    if not credential or not auth_mode:
+        logger.error("No Anthropic credential configured.")
+        return
+
+    model = claude_model_id(secrets)
+    cur = conn.execute(
+        "SELECT message_id, subject, sender, received_at, summary FROM processed_emails WHERE response_sent=0"
+    )
+    failed = cur.fetchall()
+    if not failed:
+        print("No failed emails to retry.")
+        return
+
+    print(f"Found {len(failed)} email(s) to retry.\n")
+    retried = 0
+    for mid, subject, sender, received_at, _summary in failed:
+        logger.info(f"Retrying: {subject}")
+        email_data = {
+            "message_id": mid,
+            "subject": subject,
+            "sender": sender,
+            "date": received_at,
+            "body": _summary if _summary and _summary != "Analysis failed" else f"(Original body unavailable — subject was: {subject})",
+        }
+
+        analysis = analyze_forwarded_email(email_data, credential, model, auth_mode, secrets)
+        if not analysis:
+            logger.error(f"Analysis still failing for: {subject}")
+            continue
+
+        sent = send_response(email_data, analysis, secrets)
+        if sent:
+            conn.execute(
+                "UPDATE processed_emails SET response_sent=1, summary=? WHERE message_id=?",
+                (analysis[:500], mid),
+            )
+            conn.commit()
+            retried += 1
+
+    print(f"\nRetried {retried}/{len(failed)} email(s).")
+    conn.close()
+
+
 def cmd_test(args, secrets):
     """Send a test email to the monitor address."""
     monitor_addr = secrets["smtp_user"].replace("@", "+monitor@")
@@ -806,17 +852,21 @@ def main():
     subparsers.add_parser("check", help="Check and process new emails")
     subparsers.add_parser("status", help="Show monitor status")
     subparsers.add_parser("test", help="Send a test email to the monitor")
+    subparsers.add_parser("retry", help="Re-analyze and resend failed emails")
 
     args = parser.parse_args()
     setup_logging(args.verbose)
     secrets = load_secrets()
 
-    if args.command == "check":
-        cmd_check(args, secrets)
-    elif args.command == "status":
-        cmd_status(args, secrets)
-    elif args.command == "test":
-        cmd_test(args, secrets)
+    commands = {
+        "check": cmd_check,
+        "status": cmd_status,
+        "test": cmd_test,
+        "retry": cmd_retry,
+    }
+    fn = commands.get(args.command)
+    if fn:
+        fn(args, secrets)
     else:
         parser.print_help()
 
