@@ -31,6 +31,8 @@ python3 email_monitor.py test     # send a self-test to the +monitor address
 
 Set **`response_to`** in `.secrets.json` (or env `RESPONSE_TO`) to where analysis emails should go — default is `brendan@faulds.com`.
 
+Outbound HTML uses a **high-contrast** layout (solid header, white card, dark text) so it stays readable in Gmail and other clients that flatten gradients. Analysis prompts ask the model to **avoid repeating** the same site boilerplate on every alert.
+
 Forward or address mail **To** `au.musick.com@gmail.com` or `au.musick.com+monitor@gmail.com`. Messages must stay **unread** in Gmail until `check` runs (or they are skipped). If a provider’s `To:` line is odd, the script falls back to scanning recent **UNSEEN** mail and matching `Delivered-To` / `X-Original-To` / etc. Keep reports in **INBOX** unless you set **`imap_mailbox`** (e.g. a Gmail label exposed to IMAP).
 
 ## Automation (OpenClaw)

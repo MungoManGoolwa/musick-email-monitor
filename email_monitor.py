@@ -16,6 +16,7 @@ Replies go to response_to in .secrets.json (default brendan@faulds.com).
 
 import argparse
 import email
+import html
 import email.header
 import email.utils
 import imaplib
@@ -468,42 +469,45 @@ def imap_mark_seen(secrets: dict, imap_num) -> None:
 # Anthropic (Claude) — analyze the email content
 # ---------------------------------------------------------------------------
 
-ANALYSIS_PROMPT = """You are an expert SEO and web operations advisor for musick.com.au, an Australian live music discovery platform.
+ANALYSIS_PROMPT = """You are an expert SEO and web operations advisor for musick.com.au (Australian live music discovery).
 
-You have been forwarded an email. Analyze it and provide actionable advice.
+You have been forwarded ONE email below. Produce a concise, unique analysis for THIS message only.
 
-**Context about musick.com.au:**
-- Stack: PHP 8.1 / MySQL 8.0 / OpenLiteSpeed on BinaryLane VPS (IP: 103.249.236.144)
-- Revenue: Google AdSense, Amazon Affiliates, Impact Affiliates
-- SEO is critical — the site relies on organic traffic
-- Deployment: rsync-based via deploy.sh
-- Local repo: /home/brendan/repos/musick
+**Reference context (use only when relevant to this email — do not copy it into your answer as filler):**
+- Stack: PHP / MySQL / OpenLiteSpeed on VPS; deploy often via rsync; repo commonly ~/repos/musick
+- Revenue mix includes AdSense and affiliates; SEO matters for traffic
 
-**Your response MUST follow this format:**
+**Anti-repetition (critical):**
+- Do NOT restate the whole reference context as boilerplate in every section.
+- Each section must add NEW information grounded in this email's subject/body (quote error strings, URLs, ticket IDs, product names from the body where applicable).
+- If two sections would repeat the same sentences, merge them or drop the redundant one.
+- "Email Summary" must lead with what is specific about THIS alert (not generic site description).
 
-## 📧 Email Summary
-(One paragraph summary of what the email is about)
+**Output format (Markdown):**
 
-## 🎯 What This Means
-(What impact does this have on the site, traffic, or revenue?)
+## Email summary
+One tight paragraph on what this specific email is about.
 
-## ✅ Recommended Actions
-(Numbered list of specific, actionable steps. If code changes are needed, include the exact commands or code snippets to run. Be specific about file paths.)
+## Impact
+Only if different from the summary: effect on site, users, revenue, or SEO. If nothing substantive, write "None beyond the summary above."
 
-## 🔥 Urgency
-(Rate: 🟢 Low | 🟡 Medium | 🔴 High — and explain why)
+## Recommended actions
+Numbered list. Concrete steps; include file paths or commands only when justified by this email.
 
-## 💻 Claude Code Commands
-(If any code changes are needed, provide exact commands that can be copy-pasted into a terminal on the Xeon dev machine. Format as a bash code block. If no code changes needed, say "No code changes required.")
+## Urgency
+One line: Low / Medium / High and one short reason tied to THIS email.
+
+## Claude Code
+If fixes need a coding agent: one ```bash fenced block with commands, or the exact sentence: No code changes required.
 
 ---
-Here is the forwarded email:
+Forwarded email:
 
-**From:** {sender}
-**Subject:** {subject}
-**Date:** {date}
+From: {sender}
+Subject: {subject}
+Date: {date}
 
-**Body:**
+Body:
 {body}
 """
 
@@ -668,43 +672,164 @@ def analyze_forwarded_email(
 # Send response email
 # ---------------------------------------------------------------------------
 
+# High-contrast palette for HTML mail (many clients ignore gradients; purple-on-lavender looked "washed out")
+_HTML_TEXT = "#0f172a"
+_HTML_MUTED = "#475569"
+_HTML_BORDER = "#cbd5e1"
+_HTML_ACCENT_BG = "#eef2ff"
+_HTML_ACCENT_BORDER = "#4f46e5"
+_HTML_CODE_BG = "#1e293b"
+_HTML_CODE_FG = "#f8fafc"
+
+
+def _stash_fenced_code(text: str) -> tuple[str, list[str]]:
+    """Replace ```…``` blocks with placeholders so later newline→<br> does not break <pre>."""
+    blocks: list[str] = []
+
+    def repl(m: re.Match) -> str:
+        raw = m.group(2)
+        esc = html.escape(raw.rstrip("\n"))
+        styled = (
+            f'<pre style="margin:16px 0;padding:14px 16px;background:{_HTML_CODE_BG};color:{_HTML_CODE_FG};'
+            f"border:1px solid #334155;border-radius:8px;overflow-x:auto;font-family:ui-monospace,Consolas,monospace;"
+            f'font-size:13px;line-height:1.5;white-space:pre;word-wrap:break-word;">{esc}</pre>'
+        )
+        i = len(blocks)
+        blocks.append(styled)
+        return f"\n__CODE_BLOCK_{i}__\n"
+
+    # Optional language on first line: ```bash, ```text, ```
+    t = re.sub(r"```([^\n`]*)\n(.*?)```", repl, text, flags=re.DOTALL)
+    return t, blocks
+
+
+def analysis_markdown_to_html(analysis: str) -> str:
+    """Subset of Markdown → HTML safe for email; escapes text; preserves code fences."""
+    if not analysis.strip():
+        return ""
+
+    t, code_blocks = _stash_fenced_code(analysis)
+
+    def esc_repl(pattern: str, fn, s: str, flags: int = 0) -> str:
+        def inner(m: re.Match) -> str:
+            return fn(m)
+
+        return re.sub(pattern, inner, s, flags=flags)
+
+    # ## headings (strip leading emoji spacing ok)
+    t = esc_repl(
+        r"^## (.+)$",
+        lambda m: (
+            f'<h2 style="margin:22px 0 10px 0;font-size:18px;font-weight:700;color:{_HTML_TEXT};'
+            f"border-left:4px solid {_HTML_ACCENT_BORDER};padding:0 0 0 12px;line-height:1.3;\">"
+            f"{html.escape(m.group(1).strip())}</h2>"
+        ),
+        t,
+        flags=re.MULTILINE,
+    )
+
+    # **bold** (non-greedy; after headings)
+    t = esc_repl(
+        r"\*\*(.+?)\*\*",
+        lambda m: "<strong>" + html.escape(m.group(1)) + "</strong>",
+        t,
+    )
+
+    # `inline code` — avoid matching inside placeholders
+    t = esc_repl(
+        r"`([^`]+)`",
+        lambda m: (
+            f'<code style="background:#f1f5f9;color:{_HTML_TEXT};padding:2px 6px;border-radius:4px;'
+            f'font-family:ui-monospace,Consolas,monospace;font-size:0.9em;border:1px solid #e2e8f0;">'
+            f"{html.escape(m.group(1))}</code>"
+        ),
+        t,
+    )
+
+    # Simple lists: consecutive lines starting with - or *
+    lines = t.split("\n")
+    out_lines: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^\s*[-*]\s+", line):
+            items: list[str] = []
+            while i < len(lines) and re.match(r"^\s*[-*]\s+", lines[i]):
+                item = re.sub(r"^\s*[-*]\s+", "", lines[i])
+                items.append(f'<li style="margin:6px 0;line-height:1.55;color:{_HTML_MUTED};">{item}</li>')
+                i += 1
+            out_lines.append(
+                f'<ul style="margin:12px 0;padding-left:20px;">{"".join(items)}</ul>'
+            )
+            continue
+        if re.match(r"^\s*\d+\.\s+", line):
+            items = []
+            while i < len(lines) and re.match(r"^\s*\d+\.\s+", lines[i]):
+                item = re.sub(r"^\s*\d+\.\s+", "", lines[i])
+                items.append(f'<li style="margin:6px 0;line-height:1.55;color:{_HTML_MUTED};">{item}</li>')
+                i += 1
+            out_lines.append(
+                f'<ol style="margin:12px 0;padding-left:22px;">{"".join(items)}</ol>'
+            )
+            continue
+        out_lines.append(line)
+        i += 1
+
+    t = "\n".join(out_lines)
+    t = t.replace("\n", "<br>\n")
+
+    for i, block in enumerate(code_blocks):
+        t = t.replace(f"<br>\n__CODE_BLOCK_{i}__<br>\n", block)
+        t = t.replace(f"__CODE_BLOCK_{i}__", block)
+
+    return f'<div style="color:{_HTML_MUTED};font-size:15px;line-height:1.6;">{t}</div>'
+
+
 def send_response(email_data: dict, analysis: str, secrets: dict) -> bool:
     """Send the analysis back as a formatted HTML email."""
     subject = f"[musick.com.au Monitor] RE: {email_data['subject']}"
 
-    # Convert markdown-ish analysis to basic HTML
-    html_body = analysis
-    # Headers
-    html_body = re.sub(r'^## (.+)$', r'<h2 style="color:#6b21a8; border-bottom:2px solid #e9d5ff; padding-bottom:6px; margin-top:24px;">\1</h2>', html_body, flags=re.MULTILINE)
-    # Bold
-    html_body = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html_body)
-    # Code blocks
-    html_body = re.sub(r'```bash\n(.*?)```', r'<pre style="background:#1a1a2e; color:#e2e8f0; padding:16px; border-radius:8px; overflow-x:auto; font-family:monospace; font-size:13px; line-height:1.5;">\1</pre>', html_body, flags=re.DOTALL)
-    html_body = re.sub(r'```\n?(.*?)```', r'<pre style="background:#f1f5f9; padding:12px; border-radius:6px; overflow-x:auto; font-size:13px;">\1</pre>', html_body, flags=re.DOTALL)
-    # Inline code
-    html_body = re.sub(r'`([^`]+)`', r'<code style="background:#f1f5f9; padding:2px 6px; border-radius:3px; font-size:13px;">\1</code>', html_body)
-    # Line breaks
-    html_body = html_body.replace("\n", "<br>\n")
+    safe_sender = html.escape(str(email_data.get("sender", "")))
+    safe_subject = html.escape(str(email_data.get("subject", "")))
+    safe_date = html.escape(str(email_data.get("date", "")))
+
+    html_body = analysis_markdown_to_html(analysis)
 
     full_html = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width:700px; margin:0 auto; padding:20px; color:#1a1a2e;">
-    <div style="background: linear-gradient(135deg, #6b21a8, #9333ea); border-radius:12px 12px 0 0; padding:20px; text-align:center;">
-        <h1 style="color:#fff; margin:0; font-size:20px;">🎵 musick.com.au — Email Monitor</h1>
-        <p style="color:rgba(255,255,255,0.8); margin:4px 0 0 0; font-size:13px;">Automated analysis of forwarded email</p>
-    </div>
-    <div style="background:#fff; padding:24px; border-radius:0 0 12px 12px; box-shadow:0 2px 12px rgba(107,33,168,0.08);">
-        <div style="background:#faf5ff; border:1px solid #e9d5ff; border-radius:8px; padding:12px; margin-bottom:20px; font-size:13px;">
-            <strong>Original email from:</strong> {email_data['sender']}<br>
-            <strong>Subject:</strong> {email_data['subject']}<br>
-            <strong>Date:</strong> {email_data['date']}
-        </div>
-        {html_body}
-    </div>
-    <p style="text-align:center; font-size:11px; color:#999; margin-top:16px;">
-        Generated by email_monitor.py on {datetime.now().strftime('%Y-%m-%d %H:%M')}
-    </p>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<title>{html.escape(subject)}</title>
+</head>
+<body style="margin:0;padding:0;background:#f8fafc;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;padding:24px 12px;">
+<tr><td align="center">
+<table role="presentation" width="100%" style="max-width:640px;border-collapse:collapse;background:#ffffff;border:1px solid {_HTML_BORDER};border-radius:12px;overflow:hidden;">
+<tr>
+<td style="background:{_HTML_ACCENT_BORDER};padding:18px 22px;">
+<p style="margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:11px;font-weight:600;letter-spacing:0.06em;color:#e0e7ff;text-transform:uppercase;">musick.com.au monitor</p>
+<h1 style="margin:6px 0 0 0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:20px;font-weight:700;color:#ffffff;line-height:1.25;">Alert analysis</h1>
+</td>
+</tr>
+<tr>
+<td style="padding:22px 24px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;">
+<table role="presentation" width="100%" style="border-collapse:collapse;background:{_HTML_ACCENT_BG};border:1px solid #c7d2fe;border-radius:8px;margin:0 0 20px 0;">
+<tr><td style="padding:14px 16px;font-size:14px;line-height:1.5;color:{_HTML_TEXT};">
+<strong style="color:{_HTML_TEXT};">From</strong><br><span style="color:{_HTML_MUTED};">{safe_sender}</span><br><br>
+<strong style="color:{_HTML_TEXT};">Subject</strong><br><span style="color:{_HTML_MUTED};">{safe_subject}</span><br><br>
+<strong style="color:{_HTML_TEXT};">Date</strong><br><span style="color:{_HTML_MUTED};">{safe_date}</span>
+</td></tr></table>
+{html_body}
+<p style="margin:24px 0 0 0;padding-top:16px;border-top:1px solid {_HTML_BORDER};font-size:12px;color:#94a3b8;text-align:center;">
+Generated {html.escape(datetime.now().strftime('%Y-%m-%d %H:%M'))} · musick-email-monitor
+</p>
+</td>
+</tr>
+</table>
+</td></tr>
+</table>
 </body>
 </html>"""
 
